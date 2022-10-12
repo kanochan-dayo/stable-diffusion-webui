@@ -10,6 +10,11 @@ import torch
 import numpy
 import _codecs
 import zipfile
+import re
+
+
+# PyTorch 1.13 and later have _TypedStorage renamed to TypedStorage
+TypedStorage = torch.storage.TypedStorage if hasattr(torch.storage, 'TypedStorage') else torch.storage._TypedStorage
 
 
 def encode(*args):
@@ -20,14 +25,14 @@ def encode(*args):
 class RestrictedUnpickler(pickle.Unpickler):
     def persistent_load(self, saved_id):
         assert saved_id[0] == 'storage'
-        return torch.storage._TypedStorage()
+        return TypedStorage()
 
     def find_class(self, module, name):
         if module == 'collections' and name == 'OrderedDict':
             return getattr(collections, name)
         if module == 'torch._utils' and name in ['_rebuild_tensor_v2', '_rebuild_parameter']:
             return getattr(torch._utils, name)
-        if module == 'torch' and name in ['FloatStorage', 'HalfStorage', 'IntStorage', 'LongStorage']:
+        if module == 'torch' and name in ['FloatStorage', 'HalfStorage', 'IntStorage', 'LongStorage', 'DoubleStorage']:
             return getattr(torch, name)
         if module == 'torch.nn.modules.container' and name in ['ParameterDict']:
             return getattr(torch.nn.modules.container, name)
@@ -50,11 +55,27 @@ class RestrictedUnpickler(pickle.Unpickler):
         raise pickle.UnpicklingError(f"global '{module}/{name}' is forbidden")
 
 
+allowed_zip_names = ["archive/data.pkl", "archive/version"]
+allowed_zip_names_re = re.compile(r"^archive/data/\d+$")
+
+
+def check_zip_filenames(filename, names):
+    for name in names:
+        if name in allowed_zip_names:
+            continue
+        if allowed_zip_names_re.match(name):
+            continue
+
+        raise Exception(f"bad file inside {filename}: {name}")
+
+
 def check_pt(filename):
     try:
 
         # new pytorch format is a zip file
         with zipfile.ZipFile(filename) as z:
+            check_zip_filenames(filename, z.namelist())
+
             with z.open('archive/data.pkl') as file:
                 unpickler = RestrictedUnpickler(file)
                 unpickler.load()
