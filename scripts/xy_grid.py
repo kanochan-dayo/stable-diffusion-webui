@@ -10,13 +10,16 @@ import numpy as np
 import modules.scripts as scripts
 import gradio as gr
 
-from modules import images
+from modules import images, paths, sd_samplers
 from modules.hypernetworks import hypernetwork
-from modules.processing import process_images, Processed, get_correct_sampler
+from modules.processing import process_images, Processed, StableDiffusionProcessingTxt2Img
 from modules.shared import opts, cmd_opts, state
 import modules.shared as shared
 import modules.sd_samplers
 import modules.sd_models
+import modules.sd_vae
+import glob
+import os
 import re
 
 
@@ -58,29 +61,19 @@ def apply_order(p, x, xs):
         prompt_tmp += part
         prompt_tmp += x[idx]
     p.prompt = prompt_tmp + p.prompt
-    
-
-def build_samplers_dict(p):
-    samplers_dict = {}
-    for i, sampler in enumerate(get_correct_sampler(p)):
-        samplers_dict[sampler.name.lower()] = i
-        for alias in sampler.aliases:
-            samplers_dict[alias.lower()] = i
-    return samplers_dict
 
 
 def apply_sampler(p, x, xs):
-    sampler_index = build_samplers_dict(p).get(x.lower(), None)
-    if sampler_index is None:
+    sampler_name = sd_samplers.samplers_map.get(x.lower(), None)
+    if sampler_name is None:
         raise RuntimeError(f"Unknown sampler: {x}")
 
-    p.sampler_index = sampler_index
+    p.sampler_name = sampler_name
 
 
 def confirm_samplers(p, xs):
-    samplers_dict = build_samplers_dict(p)
     for x in xs:
-        if x.lower() not in samplers_dict.keys():
+        if x.lower() not in sd_samplers.samplers_map:
             raise RuntimeError(f"Unknown sampler: {x}")
 
 
@@ -89,6 +82,7 @@ def apply_checkpoint(p, x, xs):
     if info is None:
         raise RuntimeError(f"Unknown checkpoint: {x}")
     modules.sd_models.reload_model_weights(shared.sd_model, info)
+    p.sd_model = shared.sd_model
 
 
 def confirm_checkpoints(p, xs):
@@ -107,6 +101,10 @@ def apply_hypernetwork(p, x, xs):
     hypernetwork.load_hypernetwork(name)
 
 
+def apply_hypernetwork_strength(p, x, xs):
+    hypernetwork.apply_strength(x)
+
+
 def confirm_hypernetworks(p, xs):
     for x in xs:
         if x.lower() in ["", "none"]:
@@ -117,6 +115,38 @@ def confirm_hypernetworks(p, xs):
 
 def apply_clip_skip(p, x, xs):
     opts.data["CLIP_stop_at_last_layers"] = x
+
+
+def apply_upscale_latent_space(p, x, xs):
+    if x.lower().strip() != '0':
+        opts.data["use_scale_latent_for_hires_fix"] = True
+    else:
+        opts.data["use_scale_latent_for_hires_fix"] = False
+
+
+def find_vae(name: str):
+    if name.lower() in ['auto', 'none']:
+        return name
+    else:
+        vae_path = os.path.abspath(os.path.join(paths.models_path, 'VAE'))
+        found = glob.glob(os.path.join(vae_path, f'**/{name}.*pt'), recursive=True)
+        if found:
+            return found[0]
+        else:
+            return 'auto'
+
+
+def apply_vae(p, x, xs):
+    if x.lower().strip() == 'none':
+        modules.sd_vae.reload_vae_weights(shared.sd_model, vae_file='None')
+    else:
+        found = find_vae(x)
+        if found:
+            v = modules.sd_vae.reload_vae_weights(shared.sd_model, vae_file=found)
+
+
+def apply_styles(p: StableDiffusionProcessingTxt2Img, x: str, _):
+    p.styles = x.split(',')
 
 
 def format_value_add_label(p, opt, x):
@@ -148,7 +178,6 @@ def str_permutations(x):
     """dummy function for specifying it in AxisOption's type when you want to get a list of permutations"""
     return x
 
-
 AxisOption = namedtuple("AxisOption", ["label", "type", "apply", "format_value", "confirm"])
 AxisOptionImg2Img = namedtuple("AxisOptionImg2Img", ["label", "type", "apply", "format_value", "confirm"])
 
@@ -165,23 +194,32 @@ axis_options = [
     AxisOption("Sampler", str, apply_sampler, format_value, confirm_samplers),
     AxisOption("Checkpoint name", str, apply_checkpoint, format_value, confirm_checkpoints),
     AxisOption("Hypernetwork", str, apply_hypernetwork, format_value, confirm_hypernetworks),
+    AxisOption("Hypernet str.", float, apply_hypernetwork_strength, format_value_add_label, None),
     AxisOption("Sigma Churn", float, apply_field("s_churn"), format_value_add_label, None),
     AxisOption("Sigma min", float, apply_field("s_tmin"), format_value_add_label, None),
     AxisOption("Sigma max", float, apply_field("s_tmax"), format_value_add_label, None),
     AxisOption("Sigma noise", float, apply_field("s_noise"), format_value_add_label, None),
     AxisOption("Eta", float, apply_field("eta"), format_value_add_label, None),
     AxisOption("Clip skip", int, apply_clip_skip, format_value_add_label, None),
-    AxisOptionImg2Img("Denoising", float, apply_field("denoising_strength"), format_value_add_label, None),  # as it is now all AxisOptionImg2Img items must go after AxisOption ones
+    AxisOption("Denoising", float, apply_field("denoising_strength"), format_value_add_label, None),
+    AxisOption("Upscale latent space for hires.", str, apply_upscale_latent_space, format_value_add_label, None),
+    AxisOption("Cond. Image Mask Weight", float, apply_field("inpainting_mask_weight"), format_value_add_label, None),
+    AxisOption("VAE", str, apply_vae, format_value_add_label, None),
+    AxisOption("Styles", str, apply_styles, format_value_add_label, None),
 ]
 
 
-def draw_xy_grid(p, xs, ys, x_labels, y_labels, cell, draw_legend):
-    res = []
-
+def draw_xy_grid(p, xs, ys, x_labels, y_labels, cell, draw_legend, include_lone_images):
     ver_texts = [[images.GridAnnotation(y)] for y in y_labels]
     hor_texts = [[images.GridAnnotation(x)] for x in x_labels]
 
-    first_processed = None
+    # Temporary list of all the images that are generated to be populated into the grid.
+    # Will be filled with empty images for any individual step that fails to process properly
+    image_cache = []
+
+    processed_result = None
+    cell_mode = "P"
+    cell_size = (1,1)
 
     state.job_count = len(xs) * len(ys) * p.n_iter
 
@@ -189,22 +227,58 @@ def draw_xy_grid(p, xs, ys, x_labels, y_labels, cell, draw_legend):
         for ix, x in enumerate(xs):
             state.job = f"{ix + iy * len(xs) + 1} out of {len(xs) * len(ys)}"
 
-            processed = cell(x, y)
-            if first_processed is None:
-                first_processed = processed
-
+            processed:Processed = cell(x, y)
             try:
-              res.append(processed.images[0])
+                # this dereference will throw an exception if the image was not processed
+                # (this happens in cases such as if the user stops the process from the UI)
+                processed_image = processed.images[0]
+                
+                if processed_result is None:
+                    # Use our first valid processed result as a template container to hold our full results
+                    processed_result = copy(processed)
+                    cell_mode = processed_image.mode
+                    cell_size = processed_image.size
+                    processed_result.images = [Image.new(cell_mode, cell_size)]
+
+                image_cache.append(processed_image)
+                if include_lone_images:
+                    processed_result.images.append(processed_image)
+                    processed_result.all_prompts.append(processed.prompt)
+                    processed_result.all_seeds.append(processed.seed)
+                    processed_result.infotexts.append(processed.infotexts[0])
             except:
-              res.append(Image.new(res[0].mode, res[0].size))
+                image_cache.append(Image.new(cell_mode, cell_size))
 
-    grid = images.image_grid(res, rows=len(ys))
+    if not processed_result:
+        print("Unexpected error: draw_xy_grid failed to return even a single processed image")
+        return Processed()
+
+    grid = images.image_grid(image_cache, rows=len(ys))
     if draw_legend:
-        grid = images.draw_grid_annotations(grid, res[0].width, res[0].height, hor_texts, ver_texts)
+        grid = images.draw_grid_annotations(grid, cell_size[0], cell_size[1], hor_texts, ver_texts)
 
-    first_processed.images = [grid]
+    processed_result.images[0] = grid
 
-    return first_processed
+    return processed_result
+
+
+class SharedSettingsStackHelper(object):
+    def __enter__(self):
+        self.CLIP_stop_at_last_layers = opts.CLIP_stop_at_last_layers
+        self.hypernetwork = opts.sd_hypernetwork
+        self.model = shared.sd_model
+        self.use_scale_latent_for_hires_fix = opts.use_scale_latent_for_hires_fix
+        self.vae = opts.sd_vae
+  
+    def __exit__(self, exc_type, exc_value, tb):
+        modules.sd_models.reload_model_weights(self.model)
+        modules.sd_vae.reload_vae_weights(self.model, vae_file=find_vae(self.vae))
+
+        hypernetwork.load_hypernetwork(self.hypernetwork)
+        hypernetwork.apply_strength()
+
+        opts.data["CLIP_stop_at_last_layers"] = self.CLIP_stop_at_last_layers
+        opts.data["use_scale_latent_for_hires_fix"] = self.use_scale_latent_for_hires_fix
 
 
 re_range = re.compile(r"\s*([+-]?\s*\d+)\s*-\s*([+-]?\s*\d+)(?:\s*\(([+-]\d+)\s*\))?\s*")
@@ -221,27 +295,25 @@ class Script(scripts.Script):
         current_axis_options = [x for x in axis_options if type(x) == AxisOption or type(x) == AxisOptionImg2Img and is_img2img]
 
         with gr.Row():
-            x_type = gr.Dropdown(label="X type", choices=[x.label for x in current_axis_options], value=current_axis_options[1].label, visible=False, type="index", elem_id="x_type")
-            x_values = gr.Textbox(label="X values", visible=False, lines=1)
+            x_type = gr.Dropdown(label="X type", choices=[x.label for x in current_axis_options], value=current_axis_options[1].label, type="index", elem_id="x_type")
+            x_values = gr.Textbox(label="X values", lines=1)
 
         with gr.Row():
-            y_type = gr.Dropdown(label="Y type", choices=[x.label for x in current_axis_options], value=current_axis_options[0].label, visible=False, type="index", elem_id="y_type")
-            y_values = gr.Textbox(label="Y values", visible=False, lines=1)
+            y_type = gr.Dropdown(label="Y type", choices=[x.label for x in current_axis_options], value=current_axis_options[0].label, type="index", elem_id="y_type")
+            y_values = gr.Textbox(label="Y values", lines=1)
         
         draw_legend = gr.Checkbox(label='Draw legend', value=True)
+        include_lone_images = gr.Checkbox(label='Include Separate Images', value=False)
         no_fixed_seeds = gr.Checkbox(label='Keep -1 for seeds', value=False)
 
-        return [x_type, x_values, y_type, y_values, draw_legend, no_fixed_seeds]
+        return [x_type, x_values, y_type, y_values, draw_legend, include_lone_images, no_fixed_seeds]
 
-    def run(self, p, x_type, x_values, y_type, y_values, draw_legend, no_fixed_seeds):
+    def run(self, p, x_type, x_values, y_type, y_values, draw_legend, include_lone_images, no_fixed_seeds):
         if not no_fixed_seeds:
             modules.processing.fix_seed(p)
 
         if not opts.return_grid:
             p.batch_size = 1
-
-
-        CLIP_stop_at_last_layers = opts.CLIP_stop_at_last_layers
 
         def process_axis(opt, vals):
             if opt.label == 'Nothing':
@@ -311,7 +383,7 @@ class Script(scripts.Script):
         ys = process_axis(y_opt, y_values)
 
         def fix_axis_seeds(axis_opt, axis_list):
-            if axis_opt.label == 'Seed':
+            if axis_opt.label in ['Seed','Var. seed']:
                 return [int(random.randrange(4294967294)) if val is None or val == '' or val == -1 else val for val in axis_list]
             else:
                 return axis_list
@@ -327,6 +399,9 @@ class Script(scripts.Script):
         else:
             total_steps = p.steps * len(xs) * len(ys)
 
+        if isinstance(p, StableDiffusionProcessingTxt2Img) and p.enable_hr:
+            total_steps *= 2
+
         print(f"X/Y plot will create {len(xs) * len(ys) * p.n_iter} images on a {len(xs)}x{len(ys)} grid. (Total steps to process: {total_steps * p.n_iter})")
         shared.total_tqdm.updateTotal(total_steps * p.n_iter)
 
@@ -337,24 +412,19 @@ class Script(scripts.Script):
 
             return process_images(pc)
 
-        processed = draw_xy_grid(
-            p,
-            xs=xs,
-            ys=ys,
-            x_labels=[x_opt.format_value(p, x_opt, x) for x in xs],
-            y_labels=[y_opt.format_value(p, y_opt, y) for y in ys],
-            cell=cell,
-            draw_legend=draw_legend
-        )
+        with SharedSettingsStackHelper():
+            processed = draw_xy_grid(
+                p,
+                xs=xs,
+                ys=ys,
+                x_labels=[x_opt.format_value(p, x_opt, x) for x in xs],
+                y_labels=[y_opt.format_value(p, y_opt, y) for y in ys],
+                cell=cell,
+                draw_legend=draw_legend,
+                include_lone_images=include_lone_images
+            )
 
         if opts.grid_save:
-            images.save_image(processed.images[0], p.outpath_grids, "xy_grid", prompt=p.prompt, seed=processed.seed, grid=True, p=p)
-
-        # restore checkpoint in case it was changed by axes
-        modules.sd_models.reload_model_weights(shared.sd_model)
-
-        hypernetwork.load_hypernetwork(opts.sd_hypernetwork)
-
-        opts.data["CLIP_stop_at_last_layers"] = CLIP_stop_at_last_layers
+            images.save_image(processed.images[0], p.outpath_grids, "xy_grid", extension=opts.grid_format, prompt=p.prompt, seed=processed.seed, grid=True, p=p)
 
         return processed
