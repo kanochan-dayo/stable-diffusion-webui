@@ -15,7 +15,7 @@ model:
     conditioning_key: crossattn
     monitor: val/loss_simple_ema
     scale_factor: 0.18215
-    use_ema: False
+    # use_ema: False
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
@@ -51,7 +51,8 @@ model:
         ddconfig:
           double_z: true
           z_channels: 4
-          resolution: 256
+          # resolution: 256
+          resolution: 512
           in_channels: 3
           out_ch: 3
           ch: 128
