@@ -34,3 +34,4 @@ notification.mp3
 /test/stderr.txt
 webui-user.bat
 /embedding_train
+/cache.json
